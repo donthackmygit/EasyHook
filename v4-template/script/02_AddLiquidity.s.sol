@@ -39,7 +39,7 @@ contract AddLiquidityScript is BaseScript, LiquidityHelpers {
             tickSpacing: tickSpacing,
             hooks: hookContract
         });
-        bytes memory hookData = new bytes(0);
+        bytes memory hookData = abi.encode(deployerAddress, address(0));
 
         (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(poolKey.toId());
 

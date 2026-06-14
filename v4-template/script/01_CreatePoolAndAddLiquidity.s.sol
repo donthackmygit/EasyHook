@@ -38,7 +38,7 @@ contract CreatePoolAndAddLiquidityScript is BaseScript, LiquidityHelpers {
             hooks: hookContract
         });
 
-        bytes memory hookData = new bytes(0);
+        bytes memory hookData = abi.encode(deployerAddress, address(0));
 
         int24 currentTick = TickMath.getTickAtSqrtPrice(startingPrice);
 

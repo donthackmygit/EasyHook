@@ -14,7 +14,7 @@ contract SwapScript is BaseScript {
             tickSpacing: 60,
             hooks: hookContract // This must match the pool
         });
-        bytes memory hookData = new bytes(0);
+        bytes memory hookData = abi.encode(deployerAddress, address(0));
 
         vm.startBroadcast();
 
