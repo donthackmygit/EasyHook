@@ -6,11 +6,9 @@ import {Test} from "forge-std/Test.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
-import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {CurrencyLibrary, Currency} from "@uniswap/v4-core/src/types/Currency.sol";
-import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {LiquidityAmounts} from "@uniswap/v4-core/test/utils/LiquidityAmounts.sol";
 import {IPositionManager} from "@uniswap/v4-periphery/src/interfaces/IPositionManager.sol";
 import {Constants} from "@uniswap/v4-core/test/utils/Constants.sol";
@@ -18,6 +16,7 @@ import {Constants} from "@uniswap/v4-core/test/utils/Constants.sol";
 import {EasyPosm} from "./utils/libraries/EasyPosm.sol";
 
 import {PointsHook} from "../src/PointsHook.sol";
+import {PointsRewardManager} from "../src/PointsRewardManager.sol";
 import {PointsToken} from "../src/PointsToken.sol";
 
 import {BaseTest} from "./utils/BaseTest.sol";
@@ -26,9 +25,21 @@ contract PointsHookTest is BaseTest {
     using EasyPosm for IPositionManager;
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
-    using StateLibrary for IPoolManager;
+
+    event UserAction(
+        address indexed user,
+        PoolId indexed poolId,
+        PointsHook.ActionType indexed actionType,
+        uint256 ethAmount,
+        address referrer,
+        uint256 blockTimestamp
+    );
+
+    uint256 private constant REWARD_SIGNER_PK = 0xA11CE;
+    uint256 private constant WRONG_SIGNER_PK = 0xB0B;
 
     PointsHook hook;
+    PointsRewardManager rewardManager;
     PointsToken pointsToken;
     PoolId poolId;
     PoolKey key;
@@ -44,42 +55,31 @@ contract PointsHookTest is BaseTest {
 
         (, currency1) = deployCurrencyPair();
 
-        // Deploy the hook to an address with the correct flags
-        address flags = address(
-            uint160(Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG) ^
-                (0x4444 << 144) // Namespace the hook to avoid collisions
-        );
+        address flags = address(uint160(Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG) ^ (0x4444 << 144));
         bytes memory constructorArgs = abi.encode(poolManager);
         deployCodeTo("PointsHook.sol:PointsHook", constructorArgs, flags);
         hook = PointsHook(flags);
-        pointsToken = hook.pointsToken();
 
-        // Create the pool
-        key = PoolKey(
-            Currency.wrap(address(0)),
-            currency1,
-            3000,
-            60,
-            IHooks(hook)
-        );
+        rewardManager = new PointsRewardManager(vm.addr(REWARD_SIGNER_PK));
+        pointsToken = rewardManager.pointsToken();
+
+        key = PoolKey(Currency.wrap(address(0)), currency1, 3000, 60, IHooks(hook));
         poolId = key.toId();
         poolManager.initialize(key, Constants.SQRT_PRICE_1_1);
 
-        // Provide full-range liquidity to the pool
         tickLower = TickMath.minUsableTick(key.tickSpacing);
         tickUpper = TickMath.maxUsableTick(key.tickSpacing);
 
         deal(address(this), 200 ether);
 
-        (uint256 amount0, uint256 amount1) = LiquidityAmounts
-            .getAmountsForLiquidity(
-                Constants.SQRT_PRICE_1_1,
-                TickMath.getSqrtPriceAtTick(tickLower),
-                TickMath.getSqrtPriceAtTick(tickUpper),
-                uint128(100e18)
-            );
+        (uint256 amount0, uint256 amount1) = LiquidityAmounts.getAmountsForLiquidity(
+            Constants.SQRT_PRICE_1_1,
+            TickMath.getSqrtPriceAtTick(tickLower),
+            TickMath.getSqrtPriceAtTick(tickUpper),
+            uint128(100e18)
+        );
 
-        (tokenId, ) = positionManager.mint(
+        (tokenId,) = positionManager.mint(
             key,
             tickLower,
             tickUpper,
@@ -92,134 +92,85 @@ contract PointsHookTest is BaseTest {
         );
     }
 
-    function test_PointsHook_Swap() public {
-        uint256 amountIn = 1e18;
-
-        vm.warp(block.timestamp + 1 days);
-
-        (uint256 expectedPoints, , , ) = hook.previewPoints(address(this), amountIn, false);
-
-        uint256 awardedPoints = _swapEthForToken(address(this), address(0), amountIn);
-
-        assertEq(awardedPoints, expectedPoints, "Points awarded for swap should match preview");
-    }
-
-    function test_PointsHook_AddLiquidityTracksStats() public {
-        (
-            uint256 lifetimeVolume,
-            uint256 totalRewards,
-            ,
-            uint256 liquidityEventCount,
-            ,
-            uint256 claimedToday
-        ) = _activity(address(this));
-        (
-            uint256 swapVolume,
-            uint256 liquidityVolume,
-            uint256 rewardsMinted,
-            uint256 swapCount,
-            uint256 poolLiquidityEventCount
-        ) = hook.poolStats(poolId);
-
-        assertGt(lifetimeVolume, 0, "Initial liquidity should count as user volume");
-        assertEq(totalRewards, pointsToken.balanceOf(address(this)), "User rewards should track token balance");
-        assertEq(liquidityEventCount, 1, "Setup should create one liquidity event");
-        assertEq(claimedToday, totalRewards, "Initial reward should be claimed today");
-
-        assertEq(swapVolume, 0, "No swaps happened yet");
-        assertGt(liquidityVolume, 0, "Pool should track ETH added as liquidity");
-        assertEq(rewardsMinted, totalRewards, "Pool minted rewards should match setup rewards");
-        assertEq(swapCount, 0, "No pool swaps happened yet");
-        assertEq(poolLiquidityEventCount, 1, "Pool should track one liquidity event");
-    }
-
-    function test_PointsHook_ReferralBonus() public {
-        address trader = address(0xA11CE);
-        address referrer = address(0xB0B);
-        uint256 amountIn = 1e18;
-        (, , uint256 startingRewardsMinted, , ) = hook.poolStats(poolId);
-
-        (uint256 expectedPoints, , , ) = hook.previewPoints(trader, amountIn, false);
-        uint256 expectedReferralPoints = (expectedPoints * hook.REFERRAL_BONUS_BPS()) / hook.BPS();
-
-        uint256 awardedPoints = _swapEthForToken(trader, referrer, amountIn);
-        (, , uint256 endingRewardsMinted, , ) = hook.poolStats(poolId);
-        (uint256 lifetimeVolume, uint256 totalRewards, uint256 swapCount, , , ) = _activity(trader);
-
-        assertEq(awardedPoints, expectedPoints, "Trader should receive previewed points");
-        assertEq(pointsToken.balanceOf(referrer), expectedReferralPoints, "Referrer should receive referral points");
-        assertEq(lifetimeVolume, amountIn, "Trader volume should be tracked");
-        assertEq(totalRewards, expectedPoints, "Trader rewards should be tracked");
-        assertEq(swapCount, 1, "Trader swap count should increase");
-        assertEq(hook.userPoolVolume(poolId, trader), amountIn, "Pool-user volume should be tracked");
-        assertEq(
-            endingRewardsMinted - startingRewardsMinted,
-            expectedPoints + expectedReferralPoints,
-            "Pool should track user and referral rewards"
-        );
-    }
-
-    function test_PointsHook_StreakBonusIncreasesAfterConsecutiveDay() public {
+    function test_PointsHook_EmitsUserActionOnSwap() public {
         address trader = address(0xCAFE);
-        uint256 amountIn = 1e18;
+        address referrer = address(0xBEEF);
 
-        assertEq(_swapEthForToken(trader, address(0), amountIn), amountIn, "First day should have no streak bonus");
+        vm.expectEmit(true, true, true, false, address(hook));
+        emit UserAction(trader, poolId, PointsHook.ActionType.Swap, 0, address(0), 0);
 
-        vm.warp(block.timestamp + 1 days);
+        _swapEthForToken(trader, referrer, 1e18);
+    }
 
-        (uint256 expectedPoints, uint256 multiplierBps, , uint256 streakDays) = hook.previewPoints(
-            trader,
-            amountIn,
-            false
+    function test_PointsHook_EmitsUserActionOnAddLiquidity() public {
+        (uint256 amount0, uint256 amount1) = LiquidityAmounts.getAmountsForLiquidity(
+            Constants.SQRT_PRICE_1_1,
+            TickMath.getSqrtPriceAtTick(tickLower),
+            TickMath.getSqrtPriceAtTick(tickUpper),
+            uint128(1e18)
         );
 
-        assertEq(streakDays, 2, "Second consecutive day should produce a two-day streak");
-        assertEq(multiplierBps, hook.BPS() + hook.STREAK_BONUS_PER_DAY_BPS(), "Streak should add 5%");
-        assertEq(_swapEthForToken(trader, address(0), amountIn), expectedPoints, "Second day should earn streak bonus");
+        vm.expectEmit(true, true, true, false, address(hook));
+        emit UserAction(address(this), poolId, PointsHook.ActionType.AddLiquidity, 0, address(0), 0);
 
-        (, , , , uint256 storedStreakDays, ) = _activity(trader);
-        assertEq(storedStreakDays, 2, "Streak should be stored");
-    }
-
-    function test_PointsHook_TierBonusAfterVolumeThreshold() public {
-        address trader = address(0xC0DE);
-        uint256 amountIn = 1e18;
-
-        _swapEthForToken(trader, address(0), hook.SILVER_VOLUME());
-
-        assertEq(uint256(hook.getTier(trader)), uint256(PointsHook.Tier.Silver), "Trader should reach Silver tier");
-
-        (uint256 expectedPoints, uint256 multiplierBps, PointsHook.Tier tier, ) = hook.previewPoints(
-            trader,
-            amountIn,
-            false
+        positionManager.increaseLiquidity(
+            tokenId, 1e18, amount0 + 1, amount1 + 1, block.timestamp + 1, hook.getHookData(address(this))
         );
-
-        assertEq(uint256(tier), uint256(PointsHook.Tier.Silver), "Preview should use Silver tier");
-        assertEq(multiplierBps, hook.BPS() + hook.SILVER_BONUS_BPS(), "Silver tier should add 10%");
-        assertEq(_swapEthForToken(trader, address(0), amountIn), expectedPoints, "Silver tier should boost rewards");
     }
 
-    function test_PointsHook_DailyCapLimitsLargeReward() public {
-        address trader = address(0xDAD);
-        uint256 amountIn = 101 ether;
+    function test_PointsRewardManager_ClaimsWithValidServerSignature() public {
+        address user = address(0xCAFE);
+        uint256 amount = 15e18;
+        uint256 nonce = 1;
+        uint256 deadline = block.timestamp + 1 days;
+        bytes memory signature = _signClaim(REWARD_SIGNER_PK, user, amount, nonce, deadline);
 
-        deal(address(this), 1000 ether);
+        assertEq(pointsToken.owner(), address(rewardManager), "Reward manager should own POINTS minting");
 
-        uint256 awardedPoints = _swapEthForToken(trader, address(0), amountIn);
-        (, , , , , uint256 claimedToday) = _activity(trader);
+        rewardManager.claimPoints(user, amount, nonce, deadline, signature);
 
-        assertEq(awardedPoints, hook.DAILY_REWARD_CAP(), "Daily cap should limit large rewards");
-        assertEq(claimedToday, hook.DAILY_REWARD_CAP(), "Claimed today should stop at the cap");
+        assertEq(pointsToken.balanceOf(user), amount, "Claim should mint the server-approved amount");
+        assertTrue(rewardManager.usedNonces(user, nonce), "Nonce should be marked as used");
     }
 
-    function _swapEthForToken(
-        address user,
-        address referrer,
-        uint256 amountIn
-    ) internal returns (uint256 awardedPoints) {
-        uint256 startingPoints = pointsToken.balanceOf(user);
+    function test_PointsRewardManager_RevertsInvalidSignature() public {
+        address user = address(0xCAFE);
+        uint256 amount = 15e18;
+        uint256 nonce = 1;
+        uint256 deadline = block.timestamp + 1 days;
+        bytes memory signature = _signClaim(WRONG_SIGNER_PK, user, amount, nonce, deadline);
 
+        vm.expectRevert(PointsRewardManager.InvalidSignature.selector);
+        rewardManager.claimPoints(user, amount, nonce, deadline, signature);
+    }
+
+    function test_PointsRewardManager_RevertsReusedNonce() public {
+        address user = address(0xCAFE);
+        uint256 amount = 15e18;
+        uint256 nonce = 1;
+        uint256 deadline = block.timestamp + 1 days;
+        bytes memory signature = _signClaim(REWARD_SIGNER_PK, user, amount, nonce, deadline);
+
+        rewardManager.claimPoints(user, amount, nonce, deadline, signature);
+
+        vm.expectRevert(PointsRewardManager.NonceAlreadyUsed.selector);
+        rewardManager.claimPoints(user, amount, nonce, deadline, signature);
+    }
+
+    function test_PointsRewardManager_RevertsExpiredSignature() public {
+        address user = address(0xCAFE);
+        uint256 amount = 15e18;
+        uint256 nonce = 1;
+        uint256 deadline = block.timestamp + 1;
+        bytes memory signature = _signClaim(REWARD_SIGNER_PK, user, amount, nonce, deadline);
+
+        vm.warp(deadline + 1);
+
+        vm.expectRevert(PointsRewardManager.ClaimExpired.selector);
+        rewardManager.claimPoints(user, amount, nonce, deadline, signature);
+    }
+
+    function _swapEthForToken(address user, address referrer, uint256 amountIn) internal {
         swapRouter.swap{value: amountIn}({
             amountSpecified: -int256(amountIn),
             amountLimit: 0,
@@ -229,36 +180,15 @@ contract PointsHookTest is BaseTest {
             receiver: user,
             deadline: block.timestamp + 1
         });
-
-        awardedPoints = pointsToken.balanceOf(user) - startingPoints;
     }
 
-    function _activity(
-        address user
-    )
+    function _signClaim(uint256 privateKey, address user, uint256 amount, uint256 nonce, uint256 deadline)
         internal
         view
-        returns (
-            uint256 lifetimeVolume,
-            uint256 totalRewards,
-            uint256 swapCount,
-            uint256 liquidityEventCount,
-            uint256 streakDays,
-            uint256 claimedToday
-        )
+        returns (bytes memory)
     {
-        uint256 lastActionDay;
-        uint256 lastClaimDay;
-
-        (
-            lifetimeVolume,
-            totalRewards,
-            swapCount,
-            liquidityEventCount,
-            streakDays,
-            lastActionDay,
-            claimedToday,
-            lastClaimDay
-        ) = hook.userActivity(user);
+        bytes32 digest = rewardManager.claimDigest(user, amount, nonce, deadline);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(privateKey, digest);
+        return abi.encodePacked(r, s, v);
     }
 }

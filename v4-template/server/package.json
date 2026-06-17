@@ -1,0 +1,13 @@
+{
+  "name": "easyhook-reward-server",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "ethers": "^6.13.5",
+    "express": "^4.19.2"
+  }
+}
